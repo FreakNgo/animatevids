@@ -29,6 +29,7 @@
     box-shadow: 0 16px 40px rgba(0,0,0,.5), 0 5px 0 #b45309;
     cursor: pointer;
     transition: transform .15s, box-shadow .15s, opacity .2s;
+    z-index: 10;
   }
   #playBtn:hover { transform: translate(-50%, -50%) scale(1.05); }
   #playBtn:active {
@@ -36,6 +37,12 @@
     box-shadow: 0 10px 28px rgba(0,0,0,.5), 0 2px 0 #b45309;
   }
   #playBtn.hidden { opacity: 0; pointer-events: none; }
+  #errBox {
+    position: fixed; top: 0; left: 0; right: 0;
+    background: #c92a2a; color: #fff;
+    padding: 10px 16px; font: 600 13px monospace;
+    z-index: 9999; display: none; white-space: pre-wrap;
+  }
 </style>
 </head>
 <body>
@@ -43,52 +50,60 @@
   <canvas id="c"></canvas>
   <button id="playBtn">▶ Play Story</button>
 </div>
+<div id="errBox"></div>
 
 <script>
-/* ================================================================
-   1. SETUP — fixed 9:16 virtual canvas (1080 × 1920)
-   ================================================================ */
-const VW = 1080, VH = 1920;
-const stage    = document.getElementById('stage');
-const canvas   = document.getElementById('c');
-const playBtn  = document.getElementById('playBtn');
-const ctx      = canvas.getContext('2d');
+/* ============================================================
+   1. GLOBAL ERROR HANDLER
+   ============================================================ */
+window.onerror = function (msg, src, line, col) {
+  var box = document.getElementById('errBox');
+  if (box) {
+    box.style.display = 'block';
+    box.textContent = 'ERROR: ' + msg + '  (line ' + line + ':' + col + ')';
+  }
+};
 
-function resize() {
-  const vw = innerWidth, vh = innerHeight;
-  let w, h;
-  if (vw / vh > 9 / 16) { h = vh; w = h * 9 / 16; }
-  else                  { w = vw; h = w * 16 / 9; }
-  stage.style.width  = w + 'px';
-  stage.style.height = h + 'px';
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.width  = VW * dpr;
-  canvas.height = VH * dpr;
-  canvas.style.width  = w + 'px';
-  canvas.style.height = h + 'px';
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-addEventListener('resize', resize);
-resize();
+/* ============================================================
+   2. DOM REFERENCES
+   ============================================================ */
+var VW = 1080, VH = 1920;
+var stage   = document.getElementById('stage');
+var canvas  = document.getElementById('c');
+var ctx     = canvas.getContext('2d');
+var playBtn = document.getElementById('playBtn');
 
-/* ================================================================
-   2. HELPERS
-   ================================================================ */
-const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
-const lerp  = (a,b,t) => a + (b - a) * t;
-const easeIn = t => t * t;
-const easeOut = t => 1 - Math.pow(1 - t, 3);
+/* ============================================================
+   3. STATE
+   ============================================================ */
+var T = 0;
+var playing = false;
+var rafId = null;
+var lastTs = null;
+var particles = [];
+var popups = [];
 
-function poly(x, y, r, n, rot = 0) {
+/* ============================================================
+   4. HELPERS
+   ============================================================ */
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function easeIn(t)  { return t * t; }
+function easeOut(t) { return 1 - Math.pow(1 - t, 3); }
+
+function poly(x, y, r, n, rot) {
+  if (rot === undefined) rot = 0;
   ctx.beginPath();
-  for (let i = 0; i <= n; i++) {
-    const a = rot - Math.PI/2 + i * Math.PI * 2 / n;
-    const px = x + Math.cos(a) * r;
-    const py = y + Math.sin(a) * r;
-    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  for (var i = 0; i <= n; i++) {
+    var a = rot - Math.PI / 2 + i * Math.PI * 2 / n;
+    var px = x + Math.cos(a) * r;
+    var py = y + Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
   }
   ctx.closePath();
 }
+
 function roundRectPath(x, y, w, h, r) {
   ctx.beginPath();
   ctx.moveTo(x + r, y);
@@ -99,20 +114,20 @@ function roundRectPath(x, y, w, h, r) {
   ctx.closePath();
 }
 
-/* ================================================================
-   3. STORY DATA
-   ================================================================ */
-const TOTAL = 20.0;
+/* ============================================================
+   5. STORY DATA
+   ============================================================ */
+var TOTAL = 20.0;
 
-const cues = [
+var cues = [
   { t: 0.0,  d: 3.8, text: "Welcome to Smartville—where every bite makes you smarter." },
   { t: 3.8,  d: 4.0, text: "Mia eats an apple and her IQ jumps ten points." },
   { t: 7.8,  d: 4.0, text: "Leo grabs a slice of pizza—suddenly he's a genius." },
   { t: 11.8, d: 4.0, text: "The whole town is waking up, one meal at a time." },
-  { t: 15.8, d: 4.2, text: "Smartville. Eat smart. Get smarter." },
+  { t: 15.8, d: 4.2, text: "Smartville. Eat smart. Get smarter." }
 ];
 
-const characters = [
+var characters = [
   { x: 0.22, y: 0.78, scale: 0.95, iq: 42, glow: 0, eating: false, phase: 0.0,
     pal: { skin:'#ffd8a8', skinDark:'#ffc078', hair:'#7048e8',
            shirt:'#f783ac', shirtDark:'#e64980', pants:'#343a40' } },
@@ -121,73 +136,113 @@ const characters = [
            shirt:'#4dabf7', shirtDark:'#1c7ed6', pants:'#212529' } },
   { x: 0.80, y: 0.76, scale: 0.92, iq: 51, glow: 0, eating: false, phase: 3.1,
     pal: { skin:'#ffb380', skinDark:'#ff922b', hair:'#212529',
-           shirt:'#ff922b', shirtDark:'#e8590c', pants:'#495057' } },
+           shirt:'#ff922b', shirtDark:'#e8590c', pants:'#495057' } }
 ];
 
-const foods = [
-  { owner: 0, type:'apple',  start:  5.0, fallDur: 1.5, y: -200, rot: 0, done: false },
-  { owner: 1, type:'pizza',  start:  9.0, fallDur: 1.5, y: -200, rot: 0, done: false },
-  { owner: 2, type:'cookie', start: 13.0, fallDur: 1.5, y: -200, rot: 0, done: false },
+var foods = [
+  { owner: 0, type: 'apple',  start:  5.0, fallDur: 1.5, y: -200, rot: 0, done: false },
+  { owner: 1, type: 'pizza',  start:  9.0, fallDur: 1.5, y: -200, rot: 0, done: false },
+  { owner: 2, type: 'cookie', start: 13.0, fallDur: 1.5, y: -200, rot: 0, done: false }
 ];
 
-/* ================================================================
-   4. RUNTIME STATE
-   ================================================================ */
-let T = 0;
-let playing = false;
-let rafId = null;
-let lastTs = null;
-let particles = [];
-let popups = [];
-
-/* ================================================================
-   5. VOICEOVER — Web Speech API (swap in ElevenLabs if you like)
-   ================================================================ */
-const synth = window.speechSynthesis;
-let voices = [];
-function loadVoices() { voices = synth.getVoices(); }
-synth.onvoiceschanged = loadVoices;
-loadVoices();
-
-function speak(text) {
-  if (!playing || !synth) return;
-  try {
-    synth.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    const v = voices.find(v => /Google UK English Female|Samantha|Karen|Zira|Female/i.test(v.name) && v.lang.startsWith('en'))
-           || voices.find(v => v.lang.startsWith('en'));
-    if (v) u.voice = v;
-    u.rate = 0.95;
-    u.pitch = 1.05;
-    u.volume = 1;
-    synth.speak(u);
-  } catch (e) { /* silently ignore */ }
+/* ============================================================
+   6. RESIZE
+   ============================================================ */
+function resize() {
+  var vw = innerWidth, vh = innerHeight;
+  var w, h;
+  if (vw / vh > 9 / 16) { h = vh; w = h * 9 / 16; }
+  else                  { w = vw; h = w * 16 / 9; }
+  stage.style.width  = w + 'px';
+  stage.style.height = h + 'px';
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width  = VW * dpr;
+  canvas.height = VH * dpr;
+  canvas.style.width  = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
-/* ================================================================
-   6. START / LOOP
-   ================================================================ */
+/* ============================================================
+   7. VOICEOVER
+   ============================================================ */
+var synth = window.speechSynthesis;
+var voices = [];
+function loadVoices() { try { voices = synth.getVoices(); } catch (e) {} }
+if (synth) {
+  synth.onvoiceschanged = loadVoices;
+  loadVoices();
+}
+
+function speak(text) {
+  if (!synth || !playing) return;
+  try {
+    synth.cancel();
+    var u = new SpeechSynthesisUtterance(text);
+    var v = voices.find(function (v) { return /Google UK English Female|Samantha|Karen|Zira|Female/i.test(v.name) && v.lang.indexOf('en') === 0; })
+         || voices.find(function (v) { return v.lang.indexOf('en') === 0; });
+    if (v) u.voice = v;
+    u.rate   = 0.95;
+    u.pitch  = 1.05;
+    u.volume = 1;
+    synth.speak(u);
+  } catch (e) {}
+}
+
+/* ============================================================
+   8. START STORY
+   ============================================================ */
 function startStory() {
+  if (playing) return;
   playing = true;
   T = 0;
   particles = [];
   popups = [];
-  cues.forEach(c => c._spoken = false);
-  characters.forEach((c, i) => {
-    c.iq = [42, 37, 51][i];
-    c.glow = 0;
+  cues.forEach(function (c) { c._spoken = false; });
+  characters.forEach(function (c, i) {
+    c.iq     = [42, 37, 51][i];
+    c.glow   = 0;
     c.eating = false;
   });
-  foods.forEach(f => { f.done = false; f.y = -200; f.rot = 0; });
+  foods.forEach(function (f) { f.done = false; f.y = -200; f.rot = 0; });
   playBtn.classList.add('hidden');
+
+  try {
+    if (synth) {
+      var warm = new SpeechSynthesisUtterance('');
+      warm.volume = 0;
+      synth.speak(warm);
+    }
+  } catch (e) {}
+
   if (rafId) cancelAnimationFrame(rafId);
   lastTs = null;
   rafId = requestAnimationFrame(loop);
 }
 
+/* ============================================================
+   9. LISTENERS FIRST
+   ============================================================ */
+playBtn.addEventListener('click', startStory);
+playBtn.addEventListener('pointerdown', function () {
+  if (!playing) startStory();
+});
+document.addEventListener('keydown', function (e) {
+  if (e.code === 'Space') startStory();
+});
+
+/* ============================================================
+   10. INIT SIZE
+   ============================================================ */
+resize();
+window.addEventListener('resize', resize);
+
+/* ============================================================
+   11. MAIN LOOP
+   ============================================================ */
 function loop(ts) {
   if (!lastTs) lastTs = ts;
-  const dt = Math.min((ts - lastTs) / 1000, 0.05);
+  var dt = Math.min((ts - lastTs) / 1000, 0.05);
   lastTs = ts;
 
   if (playing) {
@@ -200,65 +255,56 @@ function loop(ts) {
     }
   }
 
-  update(dt);
-  draw();
+  try { update(dt); } catch (e) { console.error('update error', e); }
+  try { draw(); }     catch (e) { console.error('draw error', e); }
 
   rafId = requestAnimationFrame(loop);
 }
 
-/* ================================================================
-   7. UPDATE
-   ================================================================ */
+/* ============================================================
+   12. UPDATE
+   ============================================================ */
 function update(dt) {
-  /* ---- food drops ---- */
-  for (const f of foods) {
-    if (f.done) continue;
-    if (T < f.start) continue;
-    const elapsed = T - f.start;
-    const t = Math.min(elapsed / f.fallDur, 1);
-    const eased = easeIn(t);
-    const char = characters[f.owner];
-    const headY = VH * char.y - 135 * char.scale;
-    const startY = -200;
-    f.y   = lerp(startY, headY - 12, eased);
+  for (var i = 0; i < foods.length; i++) {
+    var f = foods[i];
+    if (f.done || T < f.start) continue;
+    var t = Math.min((T - f.start) / f.fallDur, 1);
+    var ch = characters[f.owner];
+    var headY = VH * ch.y - 135 * ch.scale;
+    f.y   = lerp(-200, headY - 12, easeIn(t));
     f.rot = t * Math.PI * 2.5;
     if (t >= 1) {
       f.done = true;
-      char.iq += 10 + Math.floor(Math.random() * 8);
-      char.glow = 1;
-      char.eating = true;
-      spawnBurst(VW * char.x, headY);
-      popups.push({
-        x: VW * char.x, y: headY - 90, life: 1, text: '+10 IQ',
-      });
-      // stop eating after a moment
-      setTimeout(() => { char.eating = false; }, 900);
+      var bonus = 10 + Math.floor(Math.random() * 8);
+      ch.iq += bonus;
+      ch.glow = 1;
+      ch.eating = true;
+      spawnBurst(VW * ch.x, headY);
+      popups.push({ x: VW * ch.x, y: headY - 90, life: 1, text: '+' + bonus + ' IQ' });
+      (function (c) { setTimeout(function () { c.eating = false; }, 900); })(ch);
     }
   }
 
-  /* ---- glow decay ---- */
-  for (const c of characters) {
-    c.glow *= Math.pow(0.94, dt * 60);
+  for (var j = 0; j < characters.length; j++) {
+    characters[j].glow *= Math.pow(0.94, dt * 60);
   }
 
-  /* ---- particles ---- */
-  for (let i = particles.length - 1; i >= 0; i--) {
-    const p = particles[i];
+  for (var k = particles.length - 1; k >= 0; k--) {
+    var p = particles[k];
     p.x += p.vx * dt * 60;
     p.y += p.vy * dt * 60;
     p.vy += 0.04 * dt * 60;
     p.rot += p.vr * dt * 60;
     p.life -= 0.018 * dt * 60;
-    if (p.life <= 0) particles.splice(i, 1);
+    if (p.life <= 0) particles.splice(k, 1);
   }
-  for (let i = popups.length - 1; i >= 0; i--) {
-    const p = popups[i];
-    p.y -= 1.5 * dt * 60;
-    p.life -= 0.015 * dt * 60;
-    if (p.life <= 0) popups.splice(i, 1);
+  for (var m = popups.length - 1; m >= 0; m--) {
+    var pp = popups[m];
+    pp.y -= 1.5 * dt * 60;
+    pp.life -= 0.015 * dt * 60;
+    if (pp.life <= 0) popups.splice(m, 1);
   }
 
-  /* ---- ambient sparkles during "town wakes up" ---- */
   if (T > 13 && T < 16.2 && Math.random() < 0.15) {
     particles.push({
       x: Math.random() * VW,
@@ -269,24 +315,25 @@ function update(dt) {
       life: 1,
       rot: Math.random() * Math.PI * 2,
       vr: (Math.random() - 0.5) * 0.1,
-      color: '#ffd43b',
+      color: '#ffd43b'
     });
   }
 
-  /* ---- voiceover ---- */
-  const activeCue = cues.find(c => T >= c.t && T < c.t + c.d);
-  if (activeCue && !activeCue._spoken) {
-    activeCue._spoken = true;
-    speak(activeCue.text);
+  for (var n = 0; n < cues.length; n++) {
+    var c2 = cues[n];
+    if (T >= c2.t && T < c2.t + c2.d) {
+      if (!c2._spoken) { c2._spoken = true; speak(c2.text); }
+      break;
+    }
   }
 }
 
-/* ================================================================
-   8. PARTICLES
-   ================================================================ */
-const PART_COLORS = ['#ffd43b', '#ff922b', '#ff6b6b', '#ffffff', '#fab005'];
+/* ============================================================
+   13. PARTICLES
+   ============================================================ */
+var PART_COLORS = ['#ffd43b', '#ff922b', '#ff6b6b', '#ffffff', '#fab005'];
 function spawnBurst(x, y) {
-  for (let i = 0; i < 14; i++) {
+  for (var i = 0; i < 14; i++) {
     particles.push({
       x: x + (Math.random() - 0.5) * 30,
       y: y + (Math.random() - 0.5) * 30,
@@ -296,14 +343,14 @@ function spawnBurst(x, y) {
       life: 1,
       rot: Math.random() * Math.PI * 2,
       vr: (Math.random() - 0.5) * 0.3,
-      color: PART_COLORS[Math.floor(Math.random() * PART_COLORS.length)],
+      color: PART_COLORS[Math.floor(Math.random() * PART_COLORS.length)]
     });
   }
 }
 
-/* ================================================================
-   9. MAIN DRAW
-   ================================================================ */
+/* ============================================================
+   14. MAIN DRAW
+   ============================================================ */
 function draw() {
   drawSky();
   drawSun();
@@ -312,15 +359,14 @@ function draw() {
   drawTown();
   drawGround();
 
-  // characters back-to-front
-  const order = characters.map((c, i) => ({ c, i })).sort((a, b) => a.c.y - b.c.y);
-  for (const { c, i } of order) drawCharacter(c, i);
+  var order = characters.map(function (c, i) { return { c: c, i: i }; })
+                        .sort(function (a, b) { return a.c.y - b.c.y; });
+  for (var i = 0; i < order.length; i++) drawCharacter(order[i].c, order[i].i);
 
-  // food
-  for (const f of foods) drawFood(f);
+  for (var j = 0; j < foods.length; j++) drawFood(foods[j]);
 
-  // particles
-  for (const p of particles) {
+  for (var k = 0; k < particles.length; k++) {
+    var p = particles[k];
     ctx.save();
     ctx.globalAlpha = clamp(p.life, 0, 1);
     ctx.translate(p.x, p.y);
@@ -336,48 +382,40 @@ function draw() {
     ctx.restore();
   }
 
-  // +IQ popups
-  for (const p of popups) {
+  for (var m = 0; m < popups.length; m++) {
+    var pp = popups[m];
     ctx.save();
-    ctx.globalAlpha = clamp(p.life, 0, 1);
+    ctx.globalAlpha = clamp(pp.life, 0, 1);
     ctx.font = '900 52px system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.lineWidth = 8;
     ctx.strokeStyle = '#1a1a2e';
-    ctx.strokeText(p.text, p.x, p.y);
+    ctx.strokeText(pp.text, pp.x, pp.y);
     ctx.fillStyle = '#ffd43b';
-    ctx.fillText(p.text, p.x, p.y);
+    ctx.fillText(pp.text, pp.x, pp.y);
     ctx.restore();
   }
 
-  // title / tagline
   drawTitle();
   drawTagline();
-
-  // vignette
   drawVignette();
-
-  // subtitle
   drawSubtitle();
-
-  // fade in / out
   drawFade();
 }
 
-/* ================================================================
-   10. SCENE — sky, sun, clouds, mountains, town, ground
-   ================================================================ */
+/* ============================================================
+   15. SCENE
+   ============================================================ */
 function drawSky() {
-  const g = ctx.createLinearGradient(0, 0, 0, VH * 0.72);
-  g.addColorStop(0.0, '#74c0fc');
+  var g = ctx.createLinearGradient(0, 0, 0, VH * 0.72);
+  g.addColorStop(0.00, '#74c0fc');
   g.addColorStop(0.55, '#a5d8ff');
   g.addColorStop(0.85, '#ffe066');
-  g.addColorStop(1.0, '#ffd43b');
+  g.addColorStop(1.00, '#ffd43b');
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, VW, VH * 0.72);
 
-  // faceted highlights
   ctx.save();
   ctx.globalAlpha = 0.10;
   ctx.fillStyle = '#ffffff';
@@ -391,33 +429,29 @@ function drawSky() {
 }
 
 function drawSun() {
-  const sx = VW * 0.80, sy = VH * 0.14;
-  ctx.fillStyle = 'rgba(255, 224, 130, 0.35)';
-  poly(sx, sy, 160, 12, 0); ctx.fill();
-  ctx.fillStyle = '#ffe066';
-  poly(sx, sy, 110, 12, 0); ctx.fill();
-  ctx.fillStyle = '#fff3bf';
-  poly(sx, sy, 70, 12, 0); ctx.fill();
+  var sx = VW * 0.80, sy = VH * 0.14;
+  ctx.fillStyle = 'rgba(255, 224, 130, 0.35)'; poly(sx, sy, 160, 12, 0); ctx.fill();
+  ctx.fillStyle = '#ffe066';                    poly(sx, sy, 110, 12, 0); ctx.fill();
+  ctx.fillStyle = '#fff3bf';                    poly(sx, sy,  70, 12, 0); ctx.fill();
 }
 
 function drawClouds() {
-  drawCloud((T * 22) % (VW + 320) - 160, VH * 0.16, 1.0);
+  drawCloud((T * 22) % (VW + 320) - 160, VH * 0.16, 1.00);
   drawCloud((T * 14 + 420) % (VW + 320) - 160, VH * 0.30, 0.78);
-  drawCloud((T * 18 + 820) % (VW + 320) - 160, VH * 0.09, 0.9);
+  drawCloud((T * 18 + 820) % (VW + 320) - 160, VH * 0.09, 0.90);
 }
 
 function drawCloud(cx, cy, s) {
   ctx.save();
   ctx.translate(cx, cy);
   ctx.scale(s, s);
-  const pts = [[-70,20],[-50,-20],[-15,-40],[20,-35],[50,-15],[70,15],[40,35],[-20,38]];
+  var pts = [[-70,20],[-50,-20],[-15,-40],[20,-35],[50,-15],[70,15],[40,35],[-20,38]];
   ctx.fillStyle = 'rgba(255,255,255,0.95)';
   ctx.beginPath();
   ctx.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
   ctx.closePath();
   ctx.fill();
-  // shadow facet
   ctx.fillStyle = 'rgba(200, 220, 240, 0.55)';
   ctx.beginPath();
   ctx.moveTo(-20, 38); ctx.lineTo(40, 35); ctx.lineTo(20, 15); ctx.lineTo(-5, 18);
@@ -426,17 +460,15 @@ function drawCloud(cx, cy, s) {
 }
 
 function drawMountains() {
-  const baseY = VH * 0.72;
+  var baseY = VH * 0.72;
 
-  // back range
   ctx.fillStyle = '#748ffc';
-  const back = [
-    { x: -60, w: 320, h: 220 },
-    { x: 200, w: 380, h: 280 },
-    { x: 520, w: 420, h: 240 },
-    { x: 880, w: 320, h: 260 },
+  var back = [
+    { x: -60, w: 320, h: 220 }, { x: 200, w: 380, h: 280 },
+    { x: 520, w: 420, h: 240 }, { x: 880, w: 320, h: 260 }
   ];
-  for (const p of back) {
+  for (var i = 0; i < back.length; i++) {
+    var p = back[i];
     ctx.beginPath();
     ctx.moveTo(p.x, baseY);
     ctx.lineTo(p.x + p.w / 2, baseY - p.h);
@@ -444,31 +476,27 @@ function drawMountains() {
     ctx.closePath(); ctx.fill();
   }
 
-  // front range
   ctx.fillStyle = '#4c6ef5';
-  const front = [
-    { x: -80, w: 420, h: 300 },
-    { x: 280, w: 460, h: 340 },
-    { x: 680, w: 420, h: 300 },
-    { x: 980, w: 340, h: 320 },
+  var front = [
+    { x: -80, w: 420, h: 300 }, { x: 280, w: 460, h: 340 },
+    { x: 680, w: 420, h: 300 }, { x: 980, w: 340, h: 320 }
   ];
-  for (const p of front) {
+  for (var j = 0; j < front.length; j++) {
+    var q = front[j];
     ctx.beginPath();
-    ctx.moveTo(p.x, baseY);
-    ctx.lineTo(p.x + p.w / 2, baseY - p.h);
-    ctx.lineTo(p.x + p.w, baseY);
+    ctx.moveTo(q.x, baseY);
+    ctx.lineTo(q.x + q.w / 2, baseY - q.h);
+    ctx.lineTo(q.x + q.w, baseY);
     ctx.closePath(); ctx.fill();
 
-    // snow cap
-    const px = p.x + p.w / 2;
-    const py = baseY - p.h;
+    var px = q.x + q.w / 2, py = baseY - q.h;
     ctx.fillStyle = '#e7f5ff';
     ctx.beginPath();
     ctx.moveTo(px - 34, py + 62);
-    ctx.lineTo(px, py);
+    ctx.lineTo(px,      py);
     ctx.lineTo(px + 34, py + 62);
     ctx.lineTo(px + 18, py + 54);
-    ctx.lineTo(px, py + 44);
+    ctx.lineTo(px,      py + 44);
     ctx.lineTo(px - 18, py + 54);
     ctx.closePath(); ctx.fill();
     ctx.fillStyle = '#4c6ef5';
@@ -476,17 +504,16 @@ function drawMountains() {
 }
 
 function drawTown() {
-  const baseY = VH * 0.72;
-  const n = 9;
-  const bw = VW / n;
-  const shades = ['#495057', '#3b3f46', '#5c5f66', '#4a5058'];
+  var baseY = VH * 0.72;
+  var n = 9;
+  var bw = VW / n;
+  var shades = ['#495057', '#3b3f46', '#5c5f66', '#4a5058'];
 
-  for (let i = 0; i < n; i++) {
-    const x = i * bw;
-    const h = 100 + ((i * 73) % 190);
-    const y = baseY - h;
+  for (var i = 0; i < n; i++) {
+    var x = i * bw;
+    var h = 100 + ((i * 73) % 190);
+    var y = baseY - h;
 
-    // building
     ctx.fillStyle = shades[i % shades.length];
     ctx.beginPath();
     ctx.moveTo(x + 4, y);
@@ -495,16 +522,14 @@ function drawTown() {
     ctx.lineTo(x + 4, baseY);
     ctx.closePath(); ctx.fill();
 
-    // right-side shadow
     ctx.fillStyle = 'rgba(0,0,0,0.22)';
     ctx.beginPath();
     ctx.moveTo(x + bw * 0.55, y);
-    ctx.lineTo(x + bw - 4, y);
-    ctx.lineTo(x + bw - 4, baseY);
+    ctx.lineTo(x + bw - 4,    y);
+    ctx.lineTo(x + bw - 4,    baseY);
     ctx.lineTo(x + bw * 0.55, baseY);
     ctx.closePath(); ctx.fill();
 
-    // roof (triangle)
     ctx.fillStyle = '#212529';
     ctx.beginPath();
     ctx.moveTo(x - 4, y);
@@ -512,13 +537,12 @@ function drawTown() {
     ctx.lineTo(x + bw + 4, y);
     ctx.closePath(); ctx.fill();
 
-    // windows
-    for (let r = 0; r < 3; r++) {
-      for (let c = 0; c < 2; c++) {
-        const wx = x + bw * 0.20 + c * bw * 0.42;
-        const wy = y + 22 + r * 46;
+    for (var r = 0; r < 3; r++) {
+      for (var c = 0; c < 2; c++) {
+        var wx = x + bw * 0.20 + c * bw * 0.42;
+        var wy = y + 22 + r * 46;
         if (wy + 18 > baseY - 8) continue;
-        const lit = Math.sin(T * 2.4 + i * 1.9 + r * 1.3 + c * 0.5) > 0.15;
+        var lit = Math.sin(T * 2.4 + i * 1.9 + r * 1.3 + c * 0.5) > 0.15;
         ctx.fillStyle = lit ? '#ffd43b' : '#1a1a2e';
         ctx.fillRect(wx, wy, bw * 0.20, 18);
         if (lit) {
@@ -534,19 +558,14 @@ function drawTown() {
 }
 
 function drawGround() {
-  // base
   ctx.fillStyle = '#51cf66';
   ctx.fillRect(0, VH * 0.72, VW, VH * 0.28);
-
-  // lighter band
   ctx.fillStyle = '#69db7c';
   ctx.fillRect(0, VH * 0.755, VW, VH * 0.245);
-
-  // grass tufts (low-poly triangles)
   ctx.fillStyle = '#37b24d';
-  for (let x = 10; x < VW; x += 42) {
-    const h = 14 + Math.sin(x * 0.05 + T * 2) * 5;
-    const w = 8 + (x % 5);
+  for (var x = 10; x < VW; x += 42) {
+    var h = 14 + Math.sin(x * 0.05 + T * 2) * 5;
+    var w = 8 + (x % 5);
     ctx.beginPath();
     ctx.moveTo(x, VH * 0.755);
     ctx.lineTo(x + w / 2, VH * 0.755 - h);
@@ -555,18 +574,17 @@ function drawGround() {
   }
 }
 
-/* ================================================================
-   11. CHARACTERS
-   ================================================================ */
+/* ============================================================
+   16. CHARACTER
+   ============================================================ */
 function drawCharacter(c, idx) {
-  const cx = VW * c.x;
-  const groundY = VH * c.y;
-  const s = c.scale;
-  const bob = Math.sin(T * 3 + c.phase) * 2;
-  const headY = groundY - 135 * s;
-  const headR = 32 * s;
+  var cx = VW * c.x;
+  var groundY = VH * c.y;
+  var s = c.scale;
+  var bob = Math.sin(T * 3 + c.phase) * 2;
+  var headY = groundY - 135 * s;
+  var headR = 32 * s;
 
-  // ground shadow
   ctx.save();
   ctx.globalAlpha = 0.28;
   ctx.fillStyle = '#1a1a2e';
@@ -575,11 +593,10 @@ function drawCharacter(c, idx) {
   ctx.fill();
   ctx.restore();
 
-  // glow
   if (c.glow > 0.01) {
-    const g = ctx.createRadialGradient(cx, headY, 12, cx, headY, 200 * s);
-    g.addColorStop(0.0, `rgba(255, 212, 59, ${0.70 * c.glow})`);
-    g.addColorStop(0.5, `rgba(255, 212, 59, ${0.22 * c.glow})`);
+    var g = ctx.createRadialGradient(cx, headY, 12, cx, headY, 200 * s);
+    g.addColorStop(0.0, 'rgba(255, 212, 59, ' + (0.70 * c.glow) + ')');
+    g.addColorStop(0.5, 'rgba(255, 212, 59, ' + (0.22 * c.glow) + ')');
     g.addColorStop(1.0, 'rgba(255, 212, 59, 0)');
     ctx.fillStyle = g;
     ctx.beginPath();
@@ -587,9 +604,9 @@ function drawCharacter(c, idx) {
     ctx.fill();
   }
 
-  // legs
-  const bodyBot = groundY - 30 * s;
-  const legBottom = groundY + 26 * s + bob;
+  var bodyBot = groundY - 30 * s;
+  var legBottom = groundY + 26 * s + bob;
+
   ctx.fillStyle = c.pal.pants;
   ctx.beginPath();
   ctx.moveTo(cx - 16 * s, bodyBot);
@@ -604,8 +621,7 @@ function drawCharacter(c, idx) {
   ctx.lineTo(cx + 4 * s,  bodyBot);
   ctx.closePath(); ctx.fill();
 
-  // body
-  const bodyTop = groundY - 100 * s;
+  var bodyTop = groundY - 100 * s;
   ctx.fillStyle = c.pal.shirt;
   ctx.beginPath();
   ctx.moveTo(cx - 28 * s, bodyTop);
@@ -613,7 +629,6 @@ function drawCharacter(c, idx) {
   ctx.lineTo(cx + 20 * s, bodyBot);
   ctx.lineTo(cx - 20 * s, bodyBot);
   ctx.closePath(); ctx.fill();
-  // shadow side
   ctx.fillStyle = c.pal.shirtDark;
   ctx.beginPath();
   ctx.moveTo(cx,          bodyTop);
@@ -622,8 +637,7 @@ function drawCharacter(c, idx) {
   ctx.lineTo(cx,          bodyBot);
   ctx.closePath(); ctx.fill();
 
-  // arms
-  const armLift = c.eating ? 30 * s : 0;
+  var armLift = c.eating ? 30 * s : 0;
   ctx.strokeStyle = c.pal.skin;
   ctx.lineWidth = 8 * s;
   ctx.lineCap = 'round';
@@ -634,25 +648,22 @@ function drawCharacter(c, idx) {
   ctx.lineTo(cx + 40 * s, bodyTop + 55 * s - armLift);
   ctx.stroke();
 
-  // head
   poly(cx, headY, headR, 6, Math.PI / 6);
   ctx.fillStyle = c.pal.skin;
   ctx.fill();
 
-  // head shadow side
   ctx.save();
   poly(cx, headY, headR, 6, Math.PI / 6);
   ctx.clip();
   ctx.fillStyle = c.pal.skinDark;
   ctx.beginPath();
-  ctx.moveTo(cx + 4 * s, headY - headR);
-  ctx.lineTo(cx + headR, headY - headR);
-  ctx.lineTo(cx + headR, headY + headR);
-  ctx.lineTo(cx + 4 * s, headY + headR);
+  ctx.moveTo(cx + 4 * s,      headY - headR);
+  ctx.lineTo(cx + headR,      headY - headR);
+  ctx.lineTo(cx + headR,      headY + headR);
+  ctx.lineTo(cx + 4 * s,      headY + headR);
   ctx.closePath(); ctx.fill();
   ctx.restore();
 
-  // hair
   ctx.fillStyle = c.pal.hair;
   ctx.beginPath();
   ctx.moveTo(cx - headR,             headY - headR * 0.45);
@@ -663,14 +674,12 @@ function drawCharacter(c, idx) {
   ctx.lineTo(cx - headR * 0.55,      headY - headR * 0.65);
   ctx.closePath(); ctx.fill();
 
-  // eyes
   ctx.fillStyle = '#1a1a2e';
   ctx.beginPath();
   ctx.arc(cx - 9 * s, headY - 2 * s, 3 * s, 0, Math.PI * 2);
   ctx.arc(cx + 9 * s, headY - 2 * s, 3 * s, 0, Math.PI * 2);
   ctx.fill();
 
-  // smile
   ctx.strokeStyle = '#1a1a2e';
   ctx.lineWidth = 3 * s;
   ctx.lineCap = 'round';
@@ -678,12 +687,11 @@ function drawCharacter(c, idx) {
   ctx.arc(cx, headY + 7 * s, 9 * s, 0.2, Math.PI - 0.2);
   ctx.stroke();
 
-  // IQ badge
   drawIQBadge(cx, headY - headR - 34 * s, c.iq, s);
 }
 
 function drawIQBadge(cx, cy, iq, s) {
-  const w = 118 * s, h = 46 * s;
+  var w = 118 * s, h = 46 * s;
   ctx.save();
   ctx.fillStyle = 'rgba(255, 212, 59, 0.96)';
   roundRectPath(cx - w / 2, cy - h / 2, w, h, 12 * s);
@@ -692,65 +700,47 @@ function drawIQBadge(cx, cy, iq, s) {
   ctx.lineWidth = 2.5 * s;
   ctx.stroke();
   ctx.fillStyle = '#1a1a2e';
-  ctx.font = `900 ${26 * s}px system-ui, sans-serif`;
+  ctx.font = '900 ' + (26 * s) + 'px system-ui, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(`IQ ${iq}`, cx, cy + 2 * s);
+  ctx.fillText('IQ ' + iq, cx, cy + 2 * s);
   ctx.restore();
 }
 
-/* ================================================================
-   12. FOOD
-   ================================================================ */
+/* ============================================================
+   17. FOOD
+   ============================================================ */
 function drawFood(f) {
   if (f.done || T < f.start) return;
-  const s = 42;
-  if (f.type === 'apple')  drawApple(f.y === -200 ? -300 : f.y, f.rot, s);
-  if (f.type === 'pizza')  drawPizza(f.y === -200 ? -300 : f.y, f.rot, s);
-  if (f.type === 'cookie') drawCookie(f.y === -200 ? -300 : f.y, f.rot, s);
-  // (draw at f.y with owner's x)
-}
-
-// simpler: use owner x directly
-const _origDrawFood = drawFood;
-drawFood = function(f) {
-  if (f.done || T < f.start) return;
-  const s = 44;
-  const char = characters[f.owner];
-  const px = VW * char.x;
-  const py = f.y;
+  if (f.y < -100) return;
+  var ch = characters[f.owner];
+  var px = VW * ch.x;
+  var py = f.y;
+  var s  = 44;
   if (f.type === 'apple')  drawApple(px, py, f.rot, s);
   if (f.type === 'pizza')  drawPizza(px, py, f.rot, s);
   if (f.type === 'cookie') drawCookie(px, py, f.rot, s);
-};
+}
 
 function drawApple(cx, cy, rot, s) {
-  if (cy < -100) return;
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(rot);
-  // body
   ctx.fillStyle = '#e03131';
   poly(0, 0, s, 6, Math.PI / 6);
   ctx.fill();
-  // bottom shadow
   ctx.save();
-  ctx.beginPath();
-  ctx.rect(-s, 0, s * 2, s);
-  ctx.clip();
+  ctx.beginPath(); ctx.rect(-s, 0, s * 2, s); ctx.clip();
   ctx.fillStyle = '#c92a2a';
   poly(0, 0, s, 6, Math.PI / 6);
   ctx.fill();
   ctx.restore();
-  // highlight
   ctx.fillStyle = '#ff8787';
   ctx.beginPath();
   ctx.moveTo(-s * 0.42, -s * 0.45);
   ctx.lineTo(-s * 0.10, -s * 0.75);
   ctx.lineTo(-s * 0.22, -s * 0.20);
-  ctx.closePath();
-  ctx.fill();
-  // stem
+  ctx.closePath(); ctx.fill();
   ctx.strokeStyle = '#5c3d1e';
   ctx.lineWidth = s * 0.14;
   ctx.lineCap = 'round';
@@ -758,93 +748,79 @@ function drawApple(cx, cy, rot, s) {
   ctx.moveTo(0, -s * 0.90);
   ctx.lineTo(s * 0.06, -s * 1.25);
   ctx.stroke();
-  // leaf
   ctx.fillStyle = '#51cf66';
   ctx.beginPath();
   ctx.moveTo(s * 0.06, -s * 1.15);
   ctx.lineTo(s * 0.62, -s * 1.38);
   ctx.lineTo(s * 0.18, -s * 0.95);
-  ctx.closePath();
-  ctx.fill();
+  ctx.closePath(); ctx.fill();
   ctx.restore();
 }
 
 function drawPizza(cx, cy, rot, s) {
-  if (cy < -100) return;
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(rot);
-  // cheese triangle
   ctx.fillStyle = '#ffd43b';
   ctx.beginPath();
   ctx.moveTo(-s * 0.9, -s * 0.55);
-  ctx.lineTo(s * 0.9,  -s * 0.55);
-  ctx.lineTo(0,         s * 0.95);
+  ctx.lineTo( s * 0.9, -s * 0.55);
+  ctx.lineTo( 0,        s * 0.95);
   ctx.closePath(); ctx.fill();
-  // crust
   ctx.fillStyle = '#d9a066';
   ctx.beginPath();
   ctx.moveTo(-s * 0.9, -s * 0.55);
-  ctx.lineTo(s * 0.9,  -s * 0.55);
-  ctx.lineTo(s * 0.7,  -s * 0.15);
+  ctx.lineTo( s * 0.9, -s * 0.55);
+  ctx.lineTo( s * 0.7, -s * 0.15);
   ctx.lineTo(-s * 0.7, -s * 0.15);
   ctx.closePath(); ctx.fill();
-  // pepperoni
   ctx.fillStyle = '#c92a2a';
-  const pp = [[-s * 0.38, -s * 0.05, s * 0.16],
-              [ s * 0.38, -s * 0.05, s * 0.16],
-              [ 0,         s * 0.45, s * 0.14]];
-  for (const [x, y, r] of pp) {
-    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  var pp = [[-s * 0.38, -s * 0.05, s * 0.16],
+            [ s * 0.38, -s * 0.05, s * 0.16],
+            [ 0,         s * 0.45, s * 0.14]];
+  for (var i = 0; i < pp.length; i++) {
+    ctx.beginPath(); ctx.arc(pp[i][0], pp[i][1], pp[i][2], 0, Math.PI * 2); ctx.fill();
   }
   ctx.restore();
 }
 
 function drawCookie(cx, cy, rot, s) {
-  if (cy < -100) return;
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(rot);
-  // body
   ctx.fillStyle = '#d9a066';
   poly(0, 0, s, 8, 0.2);
   ctx.fill();
-  // chips
   ctx.fillStyle = '#5c3d1e';
-  const chips = [[-s * 0.32, -s * 0.28, s * 0.11],
-                 [ s * 0.24, -s * 0.38, s * 0.10],
-                 [ s * 0.36,  s * 0.18, s * 0.12],
-                 [-s * 0.14,  s * 0.34, s * 0.09],
-                 [-s * 0.04,  s * 0.02, s * 0.08]];
-  for (const [x, y, r] of chips) {
-    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  var chips = [[-s * 0.32, -s * 0.28, s * 0.11],
+               [ s * 0.24, -s * 0.38, s * 0.10],
+               [ s * 0.36,  s * 0.18, s * 0.12],
+               [-s * 0.14,  s * 0.34, s * 0.09],
+               [-s * 0.04,  s * 0.02, s * 0.08]];
+  for (var i = 0; i < chips.length; i++) {
+    ctx.beginPath(); ctx.arc(chips[i][0], chips[i][1], chips[i][2], 0, Math.PI * 2); ctx.fill();
   }
   ctx.restore();
 }
 
-/* ================================================================
-   13. TITLE & TAGLINE
-   ================================================================ */
+/* ============================================================
+   18. TITLE / TAGLINE / VIGNETTE / FADE
+   ============================================================ */
 function drawTitle() {
-  // Title visible 0.2s → 3.6s, fade out
   if (T > 3.8) return;
-  const inA  = clamp((T - 0.2) / 0.6, 0, 1);
-  const outA = clamp((3.8 - T) / 0.4, 0, 1);
-  const a = Math.min(inA, outA);
+  var inA  = clamp((T - 0.2) / 0.6, 0, 1);
+  var outA = clamp((3.8 - T) / 0.4, 0, 1);
+  var a = Math.min(inA, outA);
   if (a <= 0) return;
 
   ctx.save();
   ctx.globalAlpha = a;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-
-  const cy = VH * 0.14;
-  const sc = lerp(0.85, 1.0, easeOut(inA));
-
-  ctx.translate(VW / 2, cy);
+  var sc = lerp(0.85, 1.0, easeOut(inA));
+  ctx.translate(VW / 2, VH * 0.14);
   ctx.scale(sc, sc);
 
-  // shadow
   ctx.shadowColor = 'rgba(0,0,0,0.35)';
   ctx.shadowBlur = 24;
   ctx.shadowOffsetY = 8;
@@ -859,13 +835,12 @@ function drawTitle() {
   ctx.fillStyle = '#1a1a2e';
   ctx.font = '700 34px system-ui, -apple-system, sans-serif';
   ctx.fillText('where eating makes you smarter', 0, 72);
-
   ctx.restore();
 }
 
 function drawTagline() {
   if (T < 16.2) return;
-  const a = clamp((T - 16.2) / 0.6, 0, 1);
+  var a = clamp((T - 16.2) / 0.6, 0, 1);
   ctx.save();
   ctx.globalAlpha = a * 0.55;
   ctx.fillStyle = '#1a1a2e';
@@ -873,87 +848,8 @@ function drawTagline() {
   ctx.restore();
 }
 
-/* ================================================================
-   14. SUBTITLE (canvas-rendered, low-poly styled)
-   ================================================================ */
-function drawSubtitle() {
-  const active = cues.find(c => T >= c.t && T < c.t + c.d);
-  if (!active) return;
-
-  const cueElapsed = T - active.t;
-  const inA  = clamp(cueElapsed / 0.28, 0, 1);
-  const outA = clamp((active.d - cueElapsed) / 0.28, 0, 1);
-  const a = Math.min(inA, outA);
-  if (a <= 0) return;
-
-  ctx.save();
-  ctx.globalAlpha = a;
-
-  const fs = 46;
-  ctx.font = `800 ${fs}px system-ui, -apple-system, sans-serif`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-
-  const maxWidth = VW - 140;
-  const words = active.text.split(' ');
-  const lines = [];
-  let cur = '';
-  for (const w of words) {
-    const test = cur ? cur + ' ' + w : w;
-    if (ctx.measureText(test).width > maxWidth && cur) {
-      lines.push(cur);
-      cur = w;
-    } else {
-      cur = test;
-    }
-  }
-  if (cur) lines.push(cur);
-
-  const lineH = fs * 1.32;
-  const totalH = lineH * lines.length;
-  const padX = 46, padY = 34;
-  let maxLineW = 0;
-  for (const l of lines) maxLineW = Math.max(maxLineW, ctx.measureText(l).width);
-
-  const boxW = maxLineW + padX * 2;
-  const boxH = totalH + padY * 2;
-  const boxX = (VW - boxW) / 2;
-  const boxY = VH - 320 - boxH;
-
-  // shadow
-  ctx.shadowColor = 'rgba(0,0,0,0.5)';
-  ctx.shadowBlur = 30;
-  ctx.shadowOffsetY = 10;
-
-  // background box
-  ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
-  roundRectPath(boxX, boxY, boxW, boxH, 26);
-  ctx.fill();
-
-  ctx.shadowColor = 'transparent';
-
-  // accent line (top)
-  ctx.fillStyle = '#ffd43b';
-  roundRectPath(boxX + 24, boxY - 4, boxW - 48, 6, 3);
-  ctx.fill();
-
-  // text
-  ctx.fillStyle = '#ffffff';
-  lines.forEach((l, i) => {
-    ctx.fillText(l, VW / 2, boxY + padY + lineH * (i + 0.5));
-  });
-
-  ctx.restore();
-}
-
-/* ================================================================
-   15. VIGNETTE + FADE
-   ================================================================ */
 function drawVignette() {
-  const g = ctx.createRadialGradient(
-    VW / 2, VH / 2, VH * 0.30,
-    VW / 2, VH / 2, VH * 0.85
-  );
+  var g = ctx.createRadialGradient(VW / 2, VH / 2, VH * 0.30, VW / 2, VH / 2, VH * 0.85);
   g.addColorStop(0, 'rgba(0,0,0,0)');
   g.addColorStop(1, 'rgba(0,0,0,0.35)');
   ctx.fillStyle = g;
@@ -961,34 +857,94 @@ function drawVignette() {
 }
 
 function drawFade() {
-  // fade in
   if (T < 0.6) {
-    const a = 1 - T / 0.6;
-    ctx.fillStyle = `rgba(0,0,0,${a})`;
+    var a = 1 - T / 0.6;
+    ctx.fillStyle = 'rgba(0,0,0,' + a + ')';
     ctx.fillRect(0, 0, VW, VH);
   }
-  // fade out
   if (T > 19.4 && T < TOTAL) {
-    const a = clamp((T - 19.4) / 0.6, 0, 1);
-    ctx.fillStyle = `rgba(0,0,0,${a})`;
+    var b = clamp((T - 19.4) / 0.6, 0, 1);
+    ctx.fillStyle = 'rgba(0,0,0,' + b + ')';
     ctx.fillRect(0, 0, VW, VH);
   }
 }
 
-/* ================================================================
-   16. INIT
-   ================================================================ */
-// idle draw so the scene is visible before play
-(function idle() {
-  if (!playing) {
-    draw();
-    requestAnimationFrame(idle);
+/* ============================================================
+   19. SUBTITLE
+   ============================================================ */
+function drawSubtitle() {
+  var active = null;
+  for (var i = 0; i < cues.length; i++) {
+    if (T >= cues[i].t && T < cues[i].t + cues[i].d) { active = cues[i]; break; }
   }
-})();
+  if (!active) return;
 
-playBtn.addEventListener('click', startStory);
+  var cueElapsed = T - active.t;
+  var inA  = clamp(cueElapsed / 0.28, 0, 1);
+  var outA = clamp((active.d - cueElapsed) / 0.28, 0, 1);
+  var a = Math.min(inA, outA);
+  if (a <= 0) return;
 
-addEventListener('keydown', (e) => {
-  if (e.code === 'Space' && !playing) startStory();
-});
-</
+  ctx.save();
+  ctx.globalAlpha = a;
+
+  var fs = 46;
+  ctx.font = '800 ' + fs + 'px system-ui, -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  var maxWidth = VW - 140;
+  var words = active.text.split(' ');
+  var lines = [];
+  var cur = '';
+  for (var w = 0; w < words.length; w++) {
+    var test = cur ? cur + ' ' + words[w] : words[w];
+    if (ctx.measureText(test).width > maxWidth && cur) {
+      lines.push(cur);
+      cur = words[w];
+    } else {
+      cur = test;
+    }
+  }
+  if (cur) lines.push(cur);
+
+  var lineH = fs * 1.32;
+  var totalH = lineH * lines.length;
+  var padX = 46, padY = 34;
+  var maxLineW = 0;
+  for (var l = 0; l < lines.length; l++) {
+    maxLineW = Math.max(maxLineW, ctx.measureText(lines[l]).width);
+  }
+
+  var boxW = maxLineW + padX * 2;
+  var boxH = totalH + padY * 2;
+  var boxX = (VW - boxW) / 2;
+  var boxY = VH - 320 - boxH;
+
+  ctx.shadowColor = 'rgba(0,0,0,0.5)';
+  ctx.shadowBlur = 30;
+  ctx.shadowOffsetY = 10;
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+  roundRectPath(boxX, boxY, boxW, boxH, 26);
+  ctx.fill();
+  ctx.shadowColor = 'transparent';
+
+  ctx.fillStyle = '#ffd43b';
+  roundRectPath(boxX + 24, boxY - 4, boxW - 48, 6, 3);
+  ctx.fill();
+
+  ctx.fillStyle = '#ffffff';
+  for (var k = 0; k < lines.length; k++) {
+    ctx.fillText(lines[k], VW / 2, boxY + padY + lineH * (k + 0.5));
+  }
+
+  ctx.restore();
+}
+
+/* ============================================================
+   20. INITIAL DRAW — safe
+   ============================================================ */
+try { draw(); } catch (e) { console.error('initial draw failed', e); }
+</script>
+</body>
+</html>
